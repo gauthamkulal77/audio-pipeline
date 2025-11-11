@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Phase 1: Real-Time Audio Ingestion</title>
+    <style>
+        body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; min-height: 100vh; background-color: #f0f2f5; margin: 0; padding-top: 30px; }
+        h1 { color: #333; }
+        #status { font-size: 1.2em; font-weight: bold; margin: 20px; padding: 10px; border-radius: 5px; }
+        .connected { color: #28a745; background-color: #e9f7eb; }
+        .disconnected { color: #dc3545; background-color: #fce8e6; }
+        button { font-size: 1em; padding: 10px 20px; margin: 5px; border: none; border-radius: 5px; cursor: pointer; }
+        #startBtn { background-color: #28a745; color: white; }
+        #stopBtn { background-color: #dc3545; color: white; }
+        
+        #data-container { margin-top: 30px; width: 80%; max-width: 600px; border: 1px solid #ccc; background: #fff; border-radius: 8px; padding: 20px; }
+        #data-display { margin-top: 15px; max-height: 300px; overflow-y: auto; font-family: monospace; font-size: 0.9em; }
+        #data-display p { margin: 5px 0; padding: 5px; background: #f9f9f9; border-radius: 3px; word-break: break-all; }
+        #delete-status { font-size: 0.9em; color: #666; margin-top: 10px; }
+    </style>
+</head>
+<body>
+    <h1>Real-Time Audio Ingestion PoC</h1>
+    <p id="status" class="disconnected">Connecting to server...</p>
+    <div>
+        <button id="startBtn" disabled>Start Recording</button>
+        <button id="stopBtn" disabled>Stop Recording</button>
+    </div>
+
+    <div id="data-container">
+        <h2>Live Data Feed (from Redis)</h2>
+        <div id="data-display">
+            <p class="waiting">Waiting for new data...</p>
+        </div>
+        <p id="delete-status"></p>
+    </div>
+
+
+    <script>
+        const statusEl = document.getElementById('status');
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const dataDisplay = document.getElementById('data-display');
+        const deleteStatus = document.getElementById('delete-status');
+
+        let mediaRecorder;
+
+        // WebSocket connection
+        const ws = new WebSocket(`ws://${window.location.host}`);
+        ws.onopen = () => {
+            statusEl.textContent = '✅ Connected. Ready to start.';
+            statusEl.className = 'connected';
+            startBtn.disabled = false;
+        };
+        ws.onclose = () => {
+            statusEl.textContent = '🔴 Disconnected from server.';
+            statusEl.className = 'disconnected';
+            startBtn.disabled = true;
+            stopBtn.disabled = true;
+        };
+
+        // Audio recording functions
+        const startRecording = async () => {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream);
+                mediaRecorder.ondataavailable = (event) => {
+                    const reader = new FileReader();
+                    reader.readAsDataURL(event.data);
+                    reader.onloadend = () => {
+                        if (ws.readyState === WebSocket.OPEN) {
+                            ws.send(reader.result);
+                        }
+                    };
+                };
+                mediaRecorder.start(2000); 
+                startBtn.disabled = true;
+                stopBtn.disabled = false;
+                statusEl.textContent = '🎤 Recording...';
+            } catch (err) {
+                statusEl.textContent = '❌ Could not access microphone.';
+            }
+        };
+
+        const stopRecording = () => {
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                mediaRecorder.stop();
+                mediaRecorder.stream.getTracks().forEach(track => track.stop());
+                startBtn.disabled = false;
+                stopBtn.disabled = true;
+                statusEl.textContent = '✅ Connected. Ready to start.';
+            }
+        };
+
+        startBtn.addEventListener('click', startRecording);
+        stopBtn.addEventListener('click', stopRecording);
+
+        // --- DATA FUNCTIONS ---
+
+        const triggerDelete = async (ids) => {
+            if (ids.length === 0) return;
+            try {
+                const response = await fetch('/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ids: ids })
+                });
+                const result = await response.json();
+                console.log('Delete result:', result.message);
+                deleteStatus.textContent = `Just cleared ${result.message.split(' ')[2]} entries from DB.`;
+            } catch (err) {
+                console.error('Error deleting data:', err);
+                deleteStatus.textContent = 'Could not delete data from DB.';
+            }
+        };
+
+        const fetchData = async () => {
+            deleteStatus.textContent = ''; 
+
+            try {
+                const response = await fetch('/data');
+                if (!response.ok) throw new Error('Failed to fetch data');
+                
+                const data = await response.json();
+
+                if (data.length === 0) {
+                    // No new data, just do nothing
+                    return;
+                }
+
+                // --- THIS IS THE KEY CHANGE ---
+                // 1. Remove the "Waiting..." message if it's there
+                const waitingMsg = dataDisplay.querySelector('.waiting');
+                if (waitingMsg) {
+                    waitingMsg.remove();
+                }
+                
+                // 2. We DO NOT clear the display. We just add to it.
+                // (This line is removed: dataDisplay.innerHTML = '';)
+                // --- END OF CHANGE ---
+
+                const idsToDelete = data.map(entry => entry.id);
+                
+                data.forEach(entry => {
+                    const p = document.createElement('p');
+                    p.textContent = entry.chunkPreview; 
+                    dataDisplay.appendChild(p); // Add the new chunk to the list
+                });
+
+                // 3. Trigger deletion from Redis
+                triggerDelete(idsToDelete);
+
+            } catch (err) {
+                console.error('Error fetching data:', err);
+                dataDisplay.innerHTML = '<p style="color: red;">Error loading data.</p>';
+            }
+        };
+
+        // Run every 10 seconds to fetch and display a list of chunks
+        setInterval(fetchData, 10000); 
+        document.addEventListener('DOMContentLoaded', fetchData);
+    </script>
+</body>
+</html>
